@@ -1,8 +1,8 @@
 ## Interface: 11507
 ## Title: HealOnRaid
-## Notes: Shows your healing done as floating text on raid/party frames.
+## Notes: Shows which healing spell you cast and on whom, on the raid frames.
 ## Author: Admoney70
-## Version: 0.1.0
+## Version: 0.3.0
 ## SavedVariables: HealOnRaidDB
 
 Core.lua

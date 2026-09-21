@@ -1,7 +1,10 @@
 # HealOnRaid
 
-A small WoW Classic Era ("Classic Forever") addon that shows **your** healing done
-as floating numbers on the raid and party frames.
+A small WoW Classic Forever (1.60.x) addon that shows where **your** healing is
+landing, on the raid and party frames.
+
+The client forbids addons from reading healing amounts — see below — so this
+shows the spell name on the person you healed, not a number.
 
 ## Install
 
@@ -14,47 +17,44 @@ World of Warcraft/_classic_era_/Interface/AddOns/HealOnRaid/
 so that `Interface/AddOns/HealOnRaid/HealOnRaid.toc` exists, then reload the game
 (or `/reload` if you were already logged in).
 
-## How it detects heals (important)
+## Why there are no numbers on this client
 
-On this client (1.60.x, "Classic Forever") **the combat log is off limits to
-addons**: calling `RegisterEvent("COMBAT_LOG_EVENT_UNFILTERED")` throws
-`ADDON_ACTION_FORBIDDEN` and taints the addon for the rest of the session.
-This was confirmed independently by another addon author on build
-1.60.1.69913 (BiSHealing PR #23). There is no way around it from Lua.
+Two separate restrictions in the 1.60.x client make healing **amounts**
+unobtainable by any addon:
 
-So HealOnRaid infers heals instead:
+1. **The combat log is closed.** `RegisterEvent("COMBAT_LOG_EVENT_UNFILTERED")`
+   is a protected call: it throws `ADDON_ACTION_FORBIDDEN` and taints the addon
+   for the rest of the session. Confirmed independently on build 1.60.1.69913
+   (BiSHealing PR #23).
+2. **Health is a "secret value".** `UnitHealth()` returns a value addons may
+   store and pass along, but may not do arithmetic on, compare, or run
+   `tostring()`/`format()` on. So a health delta cannot stand in for the amount,
+   and even a secret amount could not be turned into text to draw. Grid2 hits
+   the same wall.
+
+This is a deliberate client-wide system, not something an addon can work
+around. Amounts are not coming back unless Blizzard reopens one of the two.
+
+## What it does instead
+
+Cast events are *not* secret, so the addon uses the one avenue left:
 
 1. `UNIT_SPELLCAST_SENT` records who each of your casts is aimed at.
-2. `UNIT_SPELLCAST_SUCCEEDED` says the cast landed.
-3. The target's health is then sampled for ~0.7s, and the rise is shown.
+2. `UNIT_SPELLCAST_SUCCEEDED` says it landed.
+3. The **spell name** floats up from that person's raid frame.
 
-**What this costs, compared to a combat-log addon:**
+So you see *what* you cast and *on whom*, in the place you're already looking —
+just not for how much.
 
 | | Status |
 | --- | --- |
-| Direct heal amounts | works |
-| Overhealing | **not possible** — a health delta can't see wasted healing |
-| HoT ticks | **not possible** — ticks have no cast event |
-| Crit indication | **not possible** |
-| Accuracy | approximate; damage landing in the same instant understates the heal |
+| Which spell, on which target | works |
+| Healing amounts | **impossible** (secret values) |
+| Overhealing, HoT ticks, crits | **impossible** (combat log) |
 
-If Blizzard ever reopens the combat log on this client, all four become easy
-to restore — the display layer already accepts overheal and crit arguments.
-
-## What it does
-
-- Finds the raid/party frame currently showing the healed unit and floats a
-  green `+amount` upward from it, fading out over ~1.5s.
-- Heals landing on the same person within 0.25s are merged into one number, so a
-  Chain Heal bounce or a wave of HoT ticks doesn't spam the frame.
-- Crits are shown larger.
-
-Supported frames out of the box: Blizzard compact raid frames, the party frames,
-and the player/target/focus frames. Other frame addons can register themselves:
-
-```lua
-HealOnRaid:RegisterFrame(myFrame)   -- frame must have .unit or .displayedUnit
-```
+Because no API says which spells heal, matching is by name against a built-in
+Classic list (Priest/Druid/Paladin/Shaman, plus bandages). Those names are
+English; on another locale, or for anything missing, use `/hor add <spell>`.
 
 ## Commands
 
@@ -62,9 +62,10 @@ HealOnRaid:RegisterFrame(myFrame)   -- frame must have .unit or .displayedUnit
 | --- | --- |
 | `/hor` | show the command list and current settings |
 | `/hor on` / `/hor off` | toggle the display |
-| `/hor overheal` | explains why overheal is unavailable on this client |
+| `/hor amounts` | explains why no numbers are shown on this client |
+| `/hor self` | toggle heals you cast on yourself |
+| `/hor add <spell>` | treat another spell as a heal |
 | `/hor size <n>` | font size |
-| `/hor min <n>` | hide heals smaller than `n` |
 | `/hor test` | float a test heal on your own frame |
 
 ## Settings

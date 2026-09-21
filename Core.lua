@@ -1,4 +1,16 @@
--- HealOnRaid: floating healing numbers on raid/party frames.
+-- HealOnRaid: shows where your healing is landing, on the raid/party frames.
+--
+-- NOTE ON WHY THERE ARE NO NUMBERS. This client (1.60.x) has two restrictions
+-- that together make healing amounts unobtainable by an addon:
+--   1. Registering COMBAT_LOG_EVENT_UNFILTERED is a protected call. It throws
+--      ADDON_ACTION_FORBIDDEN and taints the addon for the session.
+--   2. UnitHealth() and friends return "secret values". Addon code may store
+--      and pass them, but may not do arithmetic on them, compare them, or even
+--      run tostring()/format() on them.
+-- So neither the amounts themselves nor a health delta standing in for them
+-- can be read, and a secret number cannot be turned into text to display.
+-- What is still allowed is knowing WHICH spell you cast and WHO it landed on,
+-- which is what this addon shows.
 
 local ADDON = ...
 
@@ -15,13 +27,8 @@ local FONT = STANDARD_TEXT_FONT or "Fonts\\FRIZQT__.TTF"
 
 local defaults = {
 	enabled = true,
-	-- showOverheal/showPeriodic/showCrit needed the combat log, which this
-	-- client forbids; they are kept so the code still reads cleanly if a
-	-- future client re-opens it.
-	showOverheal = false,
-	showPeriodic = false,
-	showCrit = false,
-	minAmount = 0,          -- hide heals smaller than this
+	showSelfHeals = true,   -- include heals you cast on yourself
+	dbVersion = 2,          -- bumped when defaults change meaningfully
 	mergeWindow = 0.25,     -- seconds; heals on the same unit inside this window combine
 	duration = 1.5,         -- seconds the text stays up
 	rise = 26,              -- pixels the text floats upward
@@ -132,21 +139,8 @@ local function releaseEntry(entry)
 	end
 end
 
-local function formatAmount(amount)
-	if amount >= 1000000 then
-		return format("%.1fm", amount / 1000000)
-	elseif amount >= 10000 then
-		return format("%.1fk", amount / 1000)
-	end
-	return tostring(amount)
-end
-
 local function entryString(entry)
-	local s = "+" .. formatAmount(entry.amount)
-	if db.showOverheal and entry.overheal > 0 then
-		s = s .. " |cff999999(" .. formatAmount(entry.overheal) .. ")|r"
-	end
-	return s
+	return entry.label
 end
 
 local function layout(entry, elapsed)
@@ -182,7 +176,8 @@ updater:SetScript("OnUpdate", function()
 	end
 end)
 
-local function showHeal(guid, amount, overheal, crit)
+-- label is an ordinary string (a spell name); never a secret value.
+local function showHeal(guid, label)
 	local frame = findFrameForGUID(guid)
 	if not frame then
 		return
@@ -192,27 +187,23 @@ local function showHeal(guid, amount, overheal, crit)
 	local entry = byGUID[guid]
 
 	if entry and entry.frame == frame and (now - entry.start) <= db.mergeWindow then
-		entry.amount = entry.amount + amount
-		entry.overheal = entry.overheal + overheal
-		entry.crit = entry.crit or crit
+		-- Same target again in quick succession: just refresh the label.
+		entry.label = label
+		entry.start = now
 	else
 		entry = {
 			text = acquireText(),
 			frame = frame,
 			guid = guid,
-			amount = amount,
-			overheal = overheal,
-			crit = crit,
+			label = label,
 			start = now,
 		}
 		active[#active + 1] = entry
 		byGUID[guid] = entry
 	end
 
-	local r, g, b = unpack(amount > 0 and db.color or db.overhealColor)
-	entry.text:SetTextColor(r, g, b)
-	entry.text:SetFont(FONT,
-		(db.showCrit and entry.crit) and (db.fontSize * 1.4) or db.fontSize, "OUTLINE")
+	entry.text:SetTextColor(unpack(db.color))
+	entry.text:SetFont(FONT, db.fontSize, "OUTLINE")
 	entry.text:SetText(entryString(entry))
 	layout(entry, now - entry.start)
 
@@ -222,25 +213,44 @@ end
 --------------------------------------------------------------------
 -- Heal detection
 --
--- This client (1.60.x) makes registering COMBAT_LOG_EVENT_UNFILTERED a
--- PROTECTED call: it throws ADDON_ACTION_FORBIDDEN and taints the addon for
--- the rest of the session, so the combat log is simply not available to us.
+-- Cast events are ordinary, non-secret data, so this is the one avenue left:
+-- UNIT_SPELLCAST_SENT tells us who a cast was aimed at, UNIT_SPELLCAST_SUCCEEDED
+-- tells us it landed. No health is ever read, because health is secret.
 --
--- Instead we infer heals from the player's own cast events and then measure
--- the target's health change. UNIT_SPELLCAST_SENT tells us who a cast was
--- aimed at, UNIT_SPELLCAST_SUCCEEDED tells us it landed, and the health delta
--- over the following moments is the effective healing.
+-- The API cannot tell us whether a spell heals, so we match against a list of
+-- known healing spells. These are English names; use "/hor add <name>" on a
+-- non-English client or for anything missing.
 --------------------------------------------------------------------
 
 local playerGUID
 
+local healSpells = {
+	-- Priest
+	["Lesser Heal"] = true, ["Heal"] = true, ["Greater Heal"] = true,
+	["Flash Heal"] = true, ["Renew"] = true, ["Prayer of Healing"] = true,
+	["Holy Nova"] = true, ["Desperate Prayer"] = true,
+	-- Druid
+	["Healing Touch"] = true, ["Regrowth"] = true, ["Rejuvenation"] = true,
+	["Tranquility"] = true,
+	-- Paladin
+	["Holy Light"] = true, ["Flash of Light"] = true, ["Lay on Hands"] = true,
+	-- Shaman
+	["Healing Wave"] = true, ["Lesser Healing Wave"] = true,
+	["Chain Heal"] = true, ["Healing Stream Totem"] = true,
+	-- Warlock
+	["Health Funnel"] = true,
+}
+
+local function isHealSpell(name)
+	if not name then
+		return false
+	end
+	return healSpells[name] or (db.customSpells and db.customSpells[name])
+		or name:find("Bandage", 1, true) ~= nil
+end
+
 -- castGUID -> target name, filled in by UNIT_SPELLCAST_SENT.
 local castTargets = {}
-
--- Heals we are currently measuring the health delta for.
-local watching = {}
-
-local WATCH_TIME = 0.7  -- seconds to keep sampling a target's health
 
 local groupUnits = {}
 
@@ -262,7 +272,7 @@ end
 
 local function unitForName(name)
 	if not name then
-		return "player"
+		return "player"   -- a cast with no target is a self-cast
 	end
 	if #groupUnits == 0 then
 		rebuildGroupUnits()
@@ -275,32 +285,6 @@ local function unitForName(name)
 	end
 end
 
--- Sampling loop: for each pending heal, watch the unit's health climb.
-local watcher = CreateFrame("Frame")
-watcher:Hide()
-watcher:SetScript("OnUpdate", function()
-	local now = GetTime()
-	for i = #watching, 1, -1 do
-		local w = watching[i]
-		local current = UnitHealth(w.unit)
-		local delta = current - w.before
-		if delta > w.best then
-			w.best = delta
-		end
-
-		-- Stop early once the unit is capped: nothing more can be measured.
-		if now - w.start >= WATCH_TIME or current >= UnitHealthMax(w.unit) then
-			if w.best >= db.minAmount and w.best > 0 then
-				showHeal(w.guid, w.best, 0, false)
-			end
-			tremove(watching, i)
-		end
-	end
-	if #watching == 0 then
-		watcher:Hide()
-	end
-end)
-
 local function onCastSent(unit, target, castGUID)
 	if unit ~= "player" then
 		return
@@ -308,7 +292,7 @@ local function onCastSent(unit, target, castGUID)
 	castTargets[castGUID or 0] = target
 end
 
-local function onCastSucceeded(unit, castGUID)
+local function onCastSucceeded(unit, castGUID, spellID)
 	if unit ~= "player" then
 		return
 	end
@@ -316,28 +300,23 @@ local function onCastSucceeded(unit, castGUID)
 	local name = castTargets[castGUID or 0]
 	castTargets[castGUID or 0] = nil
 
-	local target = unitForName(name)
-	if not target or not UnitExists(target) then
+	local spellName = GetSpellInfo(spellID)
+	if not isHealSpell(spellName) then
 		return
 	end
-	-- Only friendly targets can be healed; this filters out damage casts.
-	if not UnitIsFriend("player", target) then
+
+	local target = unitForName(name)
+	if not target or not UnitExists(target) or not UnitIsFriend("player", target) then
+		return
+	end
+	if UnitIsUnit(target, "player") and not db.showSelfHeals then
 		return
 	end
 
 	local guid = UnitGUID(target)
-	if not guid then
-		return
+	if guid then
+		showHeal(guid, spellName)
 	end
-
-	watching[#watching + 1] = {
-		unit = target,
-		guid = guid,
-		before = UnitHealth(target),
-		best = 0,
-		start = GetTime(),
-	}
-	watcher:Show()
 end
 
 --------------------------------------------------------------------
@@ -346,7 +325,13 @@ end
 
 local function applyDefaults()
 	HealOnRaidDB = HealOnRaidDB or {}
+	-- Settings from before the client's restrictions were understood refer to
+	-- features that cannot exist; start those profiles over.
+	if HealOnRaidDB.dbVersion ~= defaults.dbVersion then
+		wipe(HealOnRaidDB)
+	end
 	db = HealOnRaidDB
+	db.customSpells = db.customSpells or {}
 	for key, value in pairs(defaults) do
 		if db[key] == nil then
 			if type(value) == "table" then
@@ -378,7 +363,7 @@ eventFrame:SetScript("OnEvent", function(_, event, arg1, arg2, arg3)
 		end
 	elseif event == "UNIT_SPELLCAST_SUCCEEDED" then
 		if db and db.enabled then
-			onCastSucceeded(arg1, arg2)
+			onCastSucceeded(arg1, arg2, arg3)
 		end
 	elseif event == "ADDON_LOADED" then
 		if arg1 == ADDON then
@@ -415,33 +400,40 @@ SlashCmdList.HEALONRAID = function(input)
 		db.enabled = (cmd == "on")
 		say("display " .. onOff(db.enabled))
 
-	elseif cmd == "overheal" or cmd == "hots" then
-		-- Both of these needed the combat log, which this client forbids.
-		say("|cffff9900not available on this client.|r Overheal amounts and HoT")
-		say("ticks are only in the combat log, and registering for it is a")
-		say("protected call here. Numbers shown are effective healing only.")
+	elseif cmd == "overheal" or cmd == "hots" or cmd == "min" or cmd == "amounts" then
+		say("|cffff9900Healing amounts are not obtainable on this client.|r")
+		say("The combat log is a protected registration, and UnitHealth returns")
+		say("a secret value that addons may not do arithmetic on or convert to")
+		say("text. This addon shows the spell name on the target instead.")
+
+	elseif cmd == "add" and value ~= "" then
+		-- Rest of the line, so multi-word spell names work.
+		local spell = input:match("^%s*%S+%s+(.-)%s*$")
+		db.customSpells[spell] = true
+		say("'" .. spell .. "' will now be shown as a heal.")
+
+	elseif cmd == "self" then
+		db.showSelfHeals = not db.showSelfHeals
+		say("self-heals " .. onOff(db.showSelfHeals))
 
 	elseif cmd == "size" and tonumber(value) then
 		db.fontSize = tonumber(value)
 		say("font size set to " .. db.fontSize)
 
-	elseif cmd == "min" and tonumber(value) then
-		db.minAmount = tonumber(value)
-		say("minimum heal set to " .. db.minAmount)
-
 	elseif cmd == "test" then
 		if not playerGUID then
 			return
 		end
-		showHeal(playerGUID, 742, 158, false)
+		showHeal(playerGUID, "Flash Heal")
 		say("test heal sent to your own frame")
 
 	else
 		say("commands:")
 		say("  /hor on|off       - toggle the display (" .. onOff(db.enabled) .. ")")
-		say("  /hor overheal     - why overheal is unavailable here")
+		say("  /hor amounts      - why no numbers are shown on this client")
+		say("  /hor self         - toggle self-heals (" .. onOff(db.showSelfHeals) .. ")")
+		say("  /hor add <spell>  - treat another spell as a heal")
 		say("  /hor size <n>     - font size (" .. db.fontSize .. ")")
-		say("  /hor min <n>      - hide heals below n (" .. db.minAmount .. ")")
 		say("  /hor test         - show a test heal on your own frame")
 	end
 end
