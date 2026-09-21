@@ -15,9 +15,12 @@ local FONT = STANDARD_TEXT_FONT or "Fonts\\FRIZQT__.TTF"
 
 local defaults = {
 	enabled = true,
-	showOverheal = false,   -- flip on once the basic display is confirmed working
-	showPeriodic = true,    -- HoT ticks
-	showCrit = true,        -- scale up crits
+	-- showOverheal/showPeriodic/showCrit needed the combat log, which this
+	-- client forbids; they are kept so the code still reads cleanly if a
+	-- future client re-opens it.
+	showOverheal = false,
+	showPeriodic = false,
+	showCrit = false,
 	minAmount = 0,          -- hide heals smaller than this
 	mergeWindow = 0.25,     -- seconds; heals on the same unit inside this window combine
 	duration = 1.5,         -- seconds the text stays up
@@ -217,48 +220,124 @@ local function showHeal(guid, amount, overheal, crit)
 end
 
 --------------------------------------------------------------------
--- Combat log
+-- Heal detection
+--
+-- This client (1.60.x) makes registering COMBAT_LOG_EVENT_UNFILTERED a
+-- PROTECTED call: it throws ADDON_ACTION_FORBIDDEN and taints the addon for
+-- the rest of the session, so the combat log is simply not available to us.
+--
+-- Instead we infer heals from the player's own cast events and then measure
+-- the target's health change. UNIT_SPELLCAST_SENT tells us who a cast was
+-- aimed at, UNIT_SPELLCAST_SUCCEEDED tells us it landed, and the health delta
+-- over the following moments is the effective healing.
 --------------------------------------------------------------------
 
 local playerGUID
 
-local healEvents = {
-	SPELL_HEAL = false,
-	SPELL_PERIODIC_HEAL = true,
-}
+-- castGUID -> target name, filled in by UNIT_SPELLCAST_SENT.
+local castTargets = {}
 
-local function onCombatLog()
-	local _, subevent, _, sourceGUID, _, _, _, destGUID, _, _, _,
-		_, _, _, amount, overheal, _, crit = CombatLogGetCurrentEventInfo()
+-- Heals we are currently measuring the health delta for.
+local watching = {}
 
-	local periodic = healEvents[subevent]
-	if periodic == nil then
+local WATCH_TIME = 0.7  -- seconds to keep sampling a target's health
+
+local groupUnits = {}
+
+local function rebuildGroupUnits()
+	wipe(groupUnits)
+	groupUnits[#groupUnits + 1] = "player"
+	local raid = IsInRaid() and GetNumGroupMembers() or 0
+	if raid > 0 then
+		for i = 1, raid do
+			groupUnits[#groupUnits + 1] = "raid" .. i
+		end
+	else
+		for i = 1, 4 do
+			groupUnits[#groupUnits + 1] = "party" .. i
+		end
+	end
+	groupUnits[#groupUnits + 1] = "target"
+end
+
+local function unitForName(name)
+	if not name then
+		return "player"
+	end
+	if #groupUnits == 0 then
+		rebuildGroupUnits()
+	end
+	for i = 1, #groupUnits do
+		local unit = groupUnits[i]
+		if UnitExists(unit) and UnitName(unit) == name then
+			return unit
+		end
+	end
+end
+
+-- Sampling loop: for each pending heal, watch the unit's health climb.
+local watcher = CreateFrame("Frame")
+watcher:Hide()
+watcher:SetScript("OnUpdate", function()
+	local now = GetTime()
+	for i = #watching, 1, -1 do
+		local w = watching[i]
+		local current = UnitHealth(w.unit)
+		local delta = current - w.before
+		if delta > w.best then
+			w.best = delta
+		end
+
+		-- Stop early once the unit is capped: nothing more can be measured.
+		if now - w.start >= WATCH_TIME or current >= UnitHealthMax(w.unit) then
+			if w.best >= db.minAmount and w.best > 0 then
+				showHeal(w.guid, w.best, 0, false)
+			end
+			tremove(watching, i)
+		end
+	end
+	if #watching == 0 then
+		watcher:Hide()
+	end
+end)
+
+local function onCastSent(unit, target, castGUID)
+	if unit ~= "player" then
 		return
 	end
-	if sourceGUID ~= playerGUID then
-		return
-	end
-	if periodic and not db.showPeriodic then
-		return
-	end
+	castTargets[castGUID or 0] = target
+end
 
-	amount = amount or 0
-	overheal = overheal or 0
-
-	local effective = amount - overheal
-	if effective < 0 then
-		effective = 0
-	end
-
-	-- With overheal display off, a fully-overhealed tick is just noise.
-	if effective == 0 and not db.showOverheal then
-		return
-	end
-	if effective < db.minAmount then
+local function onCastSucceeded(unit, castGUID)
+	if unit ~= "player" then
 		return
 	end
 
-	showHeal(destGUID, effective, overheal, crit and true or false)
+	local name = castTargets[castGUID or 0]
+	castTargets[castGUID or 0] = nil
+
+	local target = unitForName(name)
+	if not target or not UnitExists(target) then
+		return
+	end
+	-- Only friendly targets can be healed; this filters out damage casts.
+	if not UnitIsFriend("player", target) then
+		return
+	end
+
+	local guid = UnitGUID(target)
+	if not guid then
+		return
+	end
+
+	watching[#watching + 1] = {
+		unit = target,
+		guid = guid,
+		before = UnitHealth(target),
+		best = 0,
+		start = GetTime(),
+	}
+	watcher:Show()
 end
 
 --------------------------------------------------------------------
@@ -287,12 +366,19 @@ eventFrame:RegisterEvent("ADDON_LOADED")
 eventFrame:RegisterEvent("PLAYER_LOGIN")
 eventFrame:RegisterEvent("GROUP_ROSTER_UPDATE")
 eventFrame:RegisterEvent("PLAYER_ENTERING_WORLD")
-eventFrame:RegisterEvent("COMBAT_LOG_EVENT_UNFILTERED")
+-- COMBAT_LOG_EVENT_UNFILTERED is deliberately NOT registered: on this client
+-- that call is forbidden and taints the addon for the session.
+eventFrame:RegisterEvent("UNIT_SPELLCAST_SENT")
+eventFrame:RegisterEvent("UNIT_SPELLCAST_SUCCEEDED")
 
-eventFrame:SetScript("OnEvent", function(_, event, arg1)
-	if event == "COMBAT_LOG_EVENT_UNFILTERED" then
+eventFrame:SetScript("OnEvent", function(_, event, arg1, arg2, arg3)
+	if event == "UNIT_SPELLCAST_SENT" then
 		if db and db.enabled then
-			onCombatLog()
+			onCastSent(arg1, arg2, arg3)
+		end
+	elseif event == "UNIT_SPELLCAST_SUCCEEDED" then
+		if db and db.enabled then
+			onCastSucceeded(arg1, arg2)
 		end
 	elseif event == "ADDON_LOADED" then
 		if arg1 == ADDON then
@@ -301,8 +387,10 @@ eventFrame:SetScript("OnEvent", function(_, event, arg1)
 	elseif event == "PLAYER_LOGIN" then
 		playerGUID = UnitGUID("player")
 		candidatesDirty = true
+		rebuildGroupUnits()
 	else
 		candidatesDirty = true
+		rebuildGroupUnits()
 	end
 end)
 
@@ -327,13 +415,11 @@ SlashCmdList.HEALONRAID = function(input)
 		db.enabled = (cmd == "on")
 		say("display " .. onOff(db.enabled))
 
-	elseif cmd == "overheal" then
-		db.showOverheal = not db.showOverheal
-		say("overheal display " .. onOff(db.showOverheal))
-
-	elseif cmd == "hots" then
-		db.showPeriodic = not db.showPeriodic
-		say("HoT ticks " .. onOff(db.showPeriodic))
+	elseif cmd == "overheal" or cmd == "hots" then
+		-- Both of these needed the combat log, which this client forbids.
+		say("|cffff9900not available on this client.|r Overheal amounts and HoT")
+		say("ticks are only in the combat log, and registering for it is a")
+		say("protected call here. Numbers shown are effective healing only.")
 
 	elseif cmd == "size" and tonumber(value) then
 		db.fontSize = tonumber(value)
@@ -353,8 +439,7 @@ SlashCmdList.HEALONRAID = function(input)
 	else
 		say("commands:")
 		say("  /hor on|off       - toggle the display (" .. onOff(db.enabled) .. ")")
-		say("  /hor overheal     - toggle overheal numbers (" .. onOff(db.showOverheal) .. ")")
-		say("  /hor hots         - toggle HoT ticks (" .. onOff(db.showPeriodic) .. ")")
+		say("  /hor overheal     - why overheal is unavailable here")
 		say("  /hor size <n>     - font size (" .. db.fontSize .. ")")
 		say("  /hor min <n>      - hide heals below n (" .. db.minAmount .. ")")
 		say("  /hor test         - show a test heal on your own frame")
