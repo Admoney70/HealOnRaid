@@ -492,6 +492,13 @@ SlashCmdList.HEALONRAID = function(input)
 		db.customSpells[spell] = true
 		say("'" .. spell .. "' will now be shown as a heal.")
 
+	elseif cmd == "probe" then
+		if HealOnRaid_RunProbe then
+			HealOnRaid_RunProbe()
+		else
+			say("probe module not loaded")
+		end
+
 	elseif cmd == "estimate" then
 		db.showEstimate = not db.showEstimate
 		wipe(estimateCache)
@@ -537,6 +544,7 @@ SlashCmdList.HEALONRAID = function(input)
 		say("  /hor amounts      - why no numbers are shown on this client")
 		say("  /hor estimate     - toggle the tooltip figure (" .. onOff(db.showEstimate) .. ")")
 		say("  /hor diag <id>    - test whether tooltip figures are readable")
+		say("  /hor probe        - report what heal data this client allows")
 		say("  /hor self         - toggle self-heals (" .. onOff(db.showSelfHeals) .. ")")
 		say("  /hor add <spell>  - treat another spell as a heal")
 		say("  /hor size <n>     - font size (" .. db.fontSize .. ")")

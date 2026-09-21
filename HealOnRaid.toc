@@ -2,7 +2,8 @@
 ## Title: HealOnRaid
 ## Notes: Shows which healing spell you cast and on whom, on the raid frames.
 ## Author: Admoney70
-## Version: 0.4.0
+## Version: 0.5.0
 ## SavedVariables: HealOnRaidDB
 
 Core.lua
+Probe.lua
