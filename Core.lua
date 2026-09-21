@@ -2,8 +2,14 @@
 
 local ADDON = ...
 
-local HOR = CreateFrame("Frame", "HealOnRaid")
+-- The public API is a plain table, deliberately kept separate from any frame:
+-- a global frame sharing the addon's name is what the client was flagging as a
+-- protected action.
+local HOR = {}
 _G.HealOnRaid = HOR
+
+-- Unnamed, so it can never collide with a protected global.
+local eventFrame = CreateFrame("Frame")
 
 local FONT = STANDARD_TEXT_FONT or "Fonts\\FRIZQT__.TTF"
 
@@ -274,24 +280,27 @@ local function applyDefaults()
 	HOR.db = db
 end
 
-HOR:RegisterEvent("ADDON_LOADED")
-HOR:RegisterEvent("PLAYER_LOGIN")
-HOR:RegisterEvent("GROUP_ROSTER_UPDATE")
-HOR:RegisterEvent("PLAYER_ENTERING_WORLD")
+-- Every event this addon will ever want is registered once, here at load time.
+-- Nothing is registered or unregistered from inside a handler, and enabling or
+-- disabling the display is a flag check rather than a RegisterEvent call.
+eventFrame:RegisterEvent("ADDON_LOADED")
+eventFrame:RegisterEvent("PLAYER_LOGIN")
+eventFrame:RegisterEvent("GROUP_ROSTER_UPDATE")
+eventFrame:RegisterEvent("PLAYER_ENTERING_WORLD")
+eventFrame:RegisterEvent("COMBAT_LOG_EVENT_UNFILTERED")
 
-HOR:SetScript("OnEvent", function(self, event, arg1)
-	if event == "ADDON_LOADED" then
+eventFrame:SetScript("OnEvent", function(_, event, arg1)
+	if event == "COMBAT_LOG_EVENT_UNFILTERED" then
+		if db and db.enabled then
+			onCombatLog()
+		end
+	elseif event == "ADDON_LOADED" then
 		if arg1 == ADDON then
 			applyDefaults()
 		end
 	elseif event == "PLAYER_LOGIN" then
 		playerGUID = UnitGUID("player")
 		candidatesDirty = true
-		if db.enabled then
-			self:RegisterEvent("COMBAT_LOG_EVENT_UNFILTERED")
-		end
-	elseif event == "COMBAT_LOG_EVENT_UNFILTERED" then
-		onCombatLog()
 	else
 		candidatesDirty = true
 	end
@@ -316,11 +325,6 @@ SlashCmdList.HEALONRAID = function(input)
 
 	if cmd == "on" or cmd == "off" then
 		db.enabled = (cmd == "on")
-		if db.enabled then
-			HOR:RegisterEvent("COMBAT_LOG_EVENT_UNFILTERED")
-		else
-			HOR:UnregisterEvent("COMBAT_LOG_EVENT_UNFILTERED")
-		end
 		say("display " .. onOff(db.enabled))
 
 	elseif cmd == "overheal" then
