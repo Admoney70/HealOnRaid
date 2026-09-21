@@ -23,12 +23,15 @@ _G.HealOnRaid = HOR
 -- Unnamed, so it can never collide with a protected global.
 local eventFrame = CreateFrame("Frame")
 
+local floor = math.floor
+
 local FONT = STANDARD_TEXT_FONT or "Fonts\\FRIZQT__.TTF"
 
 local defaults = {
 	enabled = true,
 	showSelfHeals = true,   -- include heals you cast on yourself
-	dbVersion = 2,          -- bumped when defaults change meaningfully
+	showEstimate = true,    -- prefix the spell's tooltip heal figure, if readable
+	dbVersion = 3,          -- bumped when defaults change meaningfully
 	mergeWindow = 0.25,     -- seconds; heals on the same unit inside this window combine
 	duration = 1.5,         -- seconds the text stays up
 	rise = 26,              -- pixels the text floats upward
@@ -224,29 +227,91 @@ end
 
 local playerGUID
 
+-- Direct, hard-cast heals only. HoTs, channels and totems are deliberately
+-- absent: they have no per-tick cast event, so nothing could be shown for them
+-- anyway, and their tooltip figure describes the whole duration rather than the
+-- cast, which would make the estimate below misleading.
 local healSpells = {
 	-- Priest
 	["Lesser Heal"] = true, ["Heal"] = true, ["Greater Heal"] = true,
-	["Flash Heal"] = true, ["Renew"] = true, ["Prayer of Healing"] = true,
-	["Holy Nova"] = true, ["Desperate Prayer"] = true,
+	["Flash Heal"] = true, ["Holy Nova"] = true,
 	-- Druid
-	["Healing Touch"] = true, ["Regrowth"] = true, ["Rejuvenation"] = true,
-	["Tranquility"] = true,
+	["Healing Touch"] = true, ["Regrowth"] = true,
 	-- Paladin
 	["Holy Light"] = true, ["Flash of Light"] = true, ["Lay on Hands"] = true,
 	-- Shaman
-	["Healing Wave"] = true, ["Lesser Healing Wave"] = true,
-	["Chain Heal"] = true, ["Healing Stream Totem"] = true,
-	-- Warlock
-	["Health Funnel"] = true,
+	["Healing Wave"] = true, ["Lesser Healing Wave"] = true, ["Chain Heal"] = true,
 }
 
 local function isHealSpell(name)
 	if not name then
 		return false
 	end
-	return healSpells[name] or (db.customSpells and db.customSpells[name])
-		or name:find("Bandage", 1, true) ~= nil
+	return healSpells[name] or (db.customSpells and db.customSpells[name]) or false
+end
+
+--------------------------------------------------------------------
+-- Tooltip estimate
+--
+-- A spell's tooltip states what it heals for, already adjusted for your
+-- +healing gear, and it is static spell data rather than unit state, so it is
+-- not expected to be secret. "Not expected" is doing real work in that
+-- sentence, though: if this client does make it secret, or the wording does
+-- not parse, every step below fails soft and we fall back to the spell name
+-- alone. Nothing here is ever allowed to raise.
+--
+-- This is an ESTIMATE of the cast, not healing done: it cannot know crits,
+-- and it cannot know how much was wasted as overheal.
+--------------------------------------------------------------------
+
+local scanner
+local estimateCache = {}
+
+local function isSecret(value)
+	if issecretvalue then
+		local ok, secret = pcall(issecretvalue, value)
+		return ok and secret
+	end
+	return false
+end
+
+-- Returns the midpoint of the healing range in a spell's tooltip, or nil.
+local function readEstimate(spellID)
+	if estimateCache[spellID] ~= nil then
+		return estimateCache[spellID] or nil
+	end
+
+	local result
+	local ok = pcall(function()
+		if not scanner then
+			scanner = CreateFrame("GameTooltip", "HealOnRaidScanner", nil, "GameTooltipTemplate")
+		end
+		scanner:SetOwner(UIParent, "ANCHOR_NONE")
+		scanner:ClearLines()
+		scanner:SetSpellByID(spellID)
+
+		for i = 1, scanner:NumLines() do
+			local line = _G["HealOnRaidScannerTextLeft" .. i]
+			local text = line and line:GetText()
+			if text and not isSecret(text) then
+				-- "Heals a friendly target for 624 to 724." -> 624, 724
+				local low, high = text:match("(%d+)%s+%D+%s+(%d+)")
+				if low and high then
+					result = floor((tonumber(low) + tonumber(high)) / 2)
+					break
+				end
+				-- Single-figure wordings, e.g. "Heals the target for 1500."
+				local single = text:match("[Hh]eal%D+(%d+)")
+				if single then
+					result = tonumber(single)
+					break
+				end
+			end
+		end
+	end)
+
+	estimateCache[spellID] = (ok and result) or false
+	return estimateCache[spellID] or nil
 end
 
 -- castGUID -> target name, filled in by UNIT_SPELLCAST_SENT.
@@ -314,9 +379,18 @@ local function onCastSucceeded(unit, castGUID, spellID)
 	end
 
 	local guid = UnitGUID(target)
-	if guid then
-		showHeal(guid, spellName)
+	if not guid then
+		return
 	end
+
+	local label = spellName
+	if db.showEstimate then
+		local estimate = readEstimate(spellID)
+		if estimate then
+			label = "~" .. estimate .. "  |cff88cc88" .. spellName .. "|r"
+		end
+	end
+	showHeal(guid, label)
 end
 
 --------------------------------------------------------------------
@@ -353,6 +427,8 @@ eventFrame:RegisterEvent("GROUP_ROSTER_UPDATE")
 eventFrame:RegisterEvent("PLAYER_ENTERING_WORLD")
 -- COMBAT_LOG_EVENT_UNFILTERED is deliberately NOT registered: on this client
 -- that call is forbidden and taints the addon for the session.
+eventFrame:RegisterEvent("PLAYER_EQUIPMENT_CHANGED")
+eventFrame:RegisterEvent("SPELLS_CHANGED")
 eventFrame:RegisterEvent("UNIT_SPELLCAST_SENT")
 eventFrame:RegisterEvent("UNIT_SPELLCAST_SUCCEEDED")
 
@@ -365,6 +441,8 @@ eventFrame:SetScript("OnEvent", function(_, event, arg1, arg2, arg3)
 		if db and db.enabled then
 			onCastSucceeded(arg1, arg2, arg3)
 		end
+	elseif event == "PLAYER_EQUIPMENT_CHANGED" or event == "SPELLS_CHANGED" then
+		wipe(estimateCache)
 	elseif event == "ADDON_LOADED" then
 		if arg1 == ADDON then
 			applyDefaults()
@@ -404,13 +482,39 @@ SlashCmdList.HEALONRAID = function(input)
 		say("|cffff9900Healing amounts are not obtainable on this client.|r")
 		say("The combat log is a protected registration, and UnitHealth returns")
 		say("a secret value that addons may not do arithmetic on or convert to")
-		say("text. This addon shows the spell name on the target instead.")
+		say("text. What is shown is the spell you cast, plus the figure from its")
+		say("own tooltip where readable - an estimate of the cast, not healing")
+		say("done: it cannot know crits or how much was wasted as overheal.")
 
 	elseif cmd == "add" and value ~= "" then
 		-- Rest of the line, so multi-word spell names work.
 		local spell = input:match("^%s*%S+%s+(.-)%s*$")
 		db.customSpells[spell] = true
 		say("'" .. spell .. "' will now be shown as a heal.")
+
+	elseif cmd == "estimate" then
+		db.showEstimate = not db.showEstimate
+		wipe(estimateCache)
+		say("tooltip estimate " .. onOff(db.showEstimate))
+
+	elseif cmd == "diag" then
+		say("client readability check:")
+		local spellID = tonumber(value)
+		if not spellID then
+			say("  usage: /hor diag <spellID of a heal you know>")
+			say("  a rank's ID is in its tooltip on wowhead, e.g. 2061 Flash Heal")
+		else
+			wipe(estimateCache)   -- a diagnostic must never report a cached miss
+			local name = GetSpellInfo(spellID)
+			say("  spell: " .. (name or "|cffff6666unknown id|r"))
+			local estimate = readEstimate(spellID)
+			if estimate then
+				say("  tooltip figure: |cff66ff66" .. estimate .. "|r - estimates work here")
+			else
+				say("  tooltip figure: |cffff6666unreadable|r - either secret on this")
+				say("  client or an unrecognised wording; spell names only.")
+			end
+		end
 
 	elseif cmd == "self" then
 		db.showSelfHeals = not db.showSelfHeals
@@ -431,6 +535,8 @@ SlashCmdList.HEALONRAID = function(input)
 		say("commands:")
 		say("  /hor on|off       - toggle the display (" .. onOff(db.enabled) .. ")")
 		say("  /hor amounts      - why no numbers are shown on this client")
+		say("  /hor estimate     - toggle the tooltip figure (" .. onOff(db.showEstimate) .. ")")
+		say("  /hor diag <id>    - test whether tooltip figures are readable")
 		say("  /hor self         - toggle self-heals (" .. onOff(db.showSelfHeals) .. ")")
 		say("  /hor add <spell>  - treat another spell as a heal")
 		say("  /hor size <n>     - font size (" .. db.fontSize .. ")")

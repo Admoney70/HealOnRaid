@@ -35,25 +35,40 @@ unobtainable by any addon:
 This is a deliberate client-wide system, not something an addon can work
 around. Amounts are not coming back unless Blizzard reopens one of the two.
 
-## What it does instead
+## What it does instead: direct casts, with an estimate
 
 Cast events are *not* secret, so the addon uses the one avenue left:
 
 1. `UNIT_SPELLCAST_SENT` records who each of your casts is aimed at.
 2. `UNIT_SPELLCAST_SUCCEEDED` says it landed.
-3. The **spell name** floats up from that person's raid frame.
+3. The **spell name** floats up from that person's raid frame, prefixed with the
+   heal figure from that rank's own tooltip where it can be read.
 
-So you see *what* you cast and *on whom*, in the place you're already looking —
-just not for how much.
+Only **direct, hard-cast heals** are tracked. HoTs, channels and totems have no
+per-tick cast event, so nothing could be shown for them anyway, and their
+tooltip figure covers the whole duration rather than one cast.
+
+### About the estimate
+
+A Classic spell tooltip states what the spell heals for *including your +healing
+gear*, and it is static spell data rather than unit state, so it is not expected
+to be secret the way `UnitHealth` is. If this client does make it secret, or the
+wording does not parse, the addon silently falls back to the spell name alone —
+it never errors. Run `/hor diag <spellID>` to see which applies to you.
+
+**It is an estimate of the cast, not healing done.** It cannot know whether the
+heal crit, and it cannot know how much was wasted as overheal. Treat it as "I
+threw roughly this much at them", never as a measure of output.
 
 | | Status |
 | --- | --- |
 | Which spell, on which target | works |
-| Healing amounts | **impossible** (secret values) |
+| Estimated heal from the tooltip | works if tooltips are readable here (`/hor diag`) |
+| Actual healing done | **impossible** (secret values) |
 | Overhealing, HoT ticks, crits | **impossible** (combat log) |
 
 Because no API says which spells heal, matching is by name against a built-in
-Classic list (Priest/Druid/Paladin/Shaman, plus bandages). Those names are
+Classic list of direct heals (Priest/Druid/Paladin/Shaman). Those names are
 English; on another locale, or for anything missing, use `/hor add <spell>`.
 
 ## Commands
@@ -63,6 +78,8 @@ English; on another locale, or for anything missing, use `/hor add <spell>`.
 | `/hor` | show the command list and current settings |
 | `/hor on` / `/hor off` | toggle the display |
 | `/hor amounts` | explains why no numbers are shown on this client |
+| `/hor estimate` | toggle the tooltip figure |
+| `/hor diag <spellID>` | test whether tooltip figures are readable on your client |
 | `/hor self` | toggle heals you cast on yourself |
 | `/hor add <spell>` | treat another spell as a heal |
 | `/hor size <n>` | font size |
